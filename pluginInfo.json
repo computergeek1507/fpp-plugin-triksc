@@ -1,0 +1,20 @@
+{
+	"repoName": "fpp-plugin-serial-triksc",
+	"name": "Triks-C Plugin for FPP",
+	"author": "Scott Hanson (computergeek1507)",
+	"description": "LEDTriks Triks-C Output Plugin.",
+	"homeURL": "https://github.com/computergeek1507/fpp-plugin-serial-triksc",
+	"srcURL": "https://github.com/computergeek1507/fpp-plugin-serial-triksc.git",
+	"bugURL": "https://github.com/computergeek1507/fpp-plugin-serial-triksc/issues",
+	"allowUpdates": 1,
+	"versions": [
+		{
+			"minFPPVersion": "7.0",
+			"maxFPPVersion": "0",
+			"branch": "main",
+			"sha": "",
+			"dependencies": {
+			}
+		}
+	]
+}
