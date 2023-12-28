@@ -1,7 +1,6 @@
 #include <fpp-pch.h>
 
 #include <unistd.h>
-#include <ifaddrs.h>
 #include <errno.h>
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -11,12 +10,10 @@
 #include <fstream>
 #include <list>
 #include <vector>
-#include <pthread.h>
 #include <sstream>
 #include <httpserver.hpp>
 #include <cmath>
 #include <mutex>
-#include <regex>
 #include <thread>
 #include <chrono>
 #include <future>
@@ -51,18 +48,21 @@
 
 struct triksCPrivData
  {
-	unsigned char inBuf[TRIKSC_MAX_CHANNELS];
-	unsigned char workBuf[TRIKSC_MAX_CHANNELS];
-	unsigned char outBuf[TRIKSC_MAX_PANELS][194];
-	int           outputBytes[TRIKSC_MAX_PANELS];
+	uint8_t inBuf[TRIKSC_MAX_CHANNELS];
+	uint8_t workBuf[TRIKSC_MAX_CHANNELS];
+	uint8_t outBuf[TRIKSC_MAX_PANELS][194];
+	uint8_t           outputBytes[TRIKSC_MAX_PANELS];
 
-	std::string filename;
-	int  fd;
-	int  width;
-	int  height;
-	int  panels;
-	std::atomic<bool>  threadIsRunning{false};
-	std::atomic<bool>  runThread{true};
+	//std::string filename;
+	//int  fd;
+	std::string port;
+	int  width {1};
+	int  height {1};
+	int  panels {1};
+	unsigned int sc {1};
+	unsigned int channelCount {1};
+	//std::atomic<bool>  threadIsRunning{false};
+	//std::atomic<bool>  runThread{true};
 	std::atomic<bool> dataWaiting{false};
 
 	//pthread_t       processThreadID;
@@ -70,8 +70,8 @@ struct triksCPrivData
 	//pthread_mutex_t sendLock;
 	//pthread_cond_t  sendCond;
     std::mutex bufLock; 
-    std::mutex sendLock; 
-    std::thread  processThread;
+    //std::mutex sendLock; 
+    //std::thread  processThread;
 };
 
 class TriksCPlugin : public FPPPlugin, public httpserver::http_resource {
@@ -79,6 +79,12 @@ public:
     bool enabled {false};
     std::unique_ptr<triksCPrivData> data{nullptr};
     //std::thread thr;
+
+	std::mutex queueLock;
+    std::atomic_int m_fd{0};
+
+    std::promise<void> exitSignal;
+    std::unique_ptr<std::thread> th;
   
     TriksCPlugin() : FPPPlugin("fpp-plugin-triksc") {
         LogInfo(VB_PLUGIN, "Initializing TriksC Plugin\n");        
@@ -89,42 +95,58 @@ public:
     }
     bool InitSerial() {
         if (FileExists(FPP_DIR_CONFIG("/plugin.triksc.json"))) {
-            std::string port;
-            std::string panels;
-            unsigned int sc = 1;
+            //std::string port;
+            //std::string panels;
+            //unsigned int sc = 1;
+			//int width = 1;
+			//int height = 1;
             try {
                 Json::Value root;
                 bool success =  LoadJsonFromFile(FPP_DIR_CONFIG("/plugin.triksc.json"), root);
+
+				data = std::make_unique<triksCPrivData>();
                 
                 if (root.isMember("port")) {
-                    port = root["port"].asString();
+                    data->port = root["port"].asString();
                 }
                 if (root.isMember("startchannel")) {
-                    sc = root["startchannel"].asInt();
-                } 
+                    data->sc = root["startchannel"].asInt();
+                }
+				if (root.isMember("width")) {
+                    data->width = root["width"].asInt();
+                }
+				if (root.isMember("height")) {
+                    data->height = root["height"].asInt();
+                }
 
-                LogInfo(VB_PLUGIN, "Using %s Serial Output Start Channel %d\n", port.c_str(), sc);
-                if(port.empty()) {
-                    LogErr(VB_PLUGIN, "Serial Port is empty '%s'\n", port.c_str());
+				data->panels = data->width * data->height;
+				data->channelCount = data->panels * TRIKSC_PANEL_CHANNELS;
+
+                LogInfo(VB_PLUGIN, "Using %s Serial Output Start Channel %d\n", data->port.c_str(), data->sc);
+                if(data->port.empty()) {
+                    LogErr(VB_PLUGIN, "Serial Port is empty '%s'\n", data->port.c_str());
                     return false;
                 }
-                if(port.find("/dev/") == std::string::npos)
+                if(data->port.find("/dev/") == std::string::npos)
                 {
-                    port = "/dev/" + port;
+                    data->port = "/dev/" + data->port;
                 }
-                int fd = SerialOpen(port.c_str(), 9600, "8N1", false);
+                int fd = SerialOpen(data->port.c_str(), 9600, "8N1", false);
                 if (fd < 0) {
-                    LogErr(VB_PLUGIN, "Could Not Open Serial Port '%s'\n", port.c_str());
+                    LogErr(VB_PLUGIN, "Could Not Open Serial Port '%s'\n", data->port.c_str());
                     return false;
                 }
                 m_fd = fd;
                 std::this_thread::sleep_for(std::chrono::milliseconds(10));
                 tcflush(m_fd,TCIOFLUSH);
-                ioctl(m_fd, TCIOFLUSH, 2); 
+                ioctl(m_fd, TCIOFLUSH, 2);
+				std::future<void> futureObj = exitSignal.get_future();
+                // Starting Thread & move the future object in lambda function by reference
+                th.reset(new std::thread(&TriksCPlugin::threadFunction, this, std::move(futureObj)));
                 LogInfo(VB_PLUGIN, "Serial Input Started\n");
                 return true;
             } catch (...) {
-                LogErr(VB_PLUGIN, "Could not Initialize Serial Port '%s'\n", port.c_str());
+                LogErr(VB_PLUGIN, "Could not Initialize Serial Port '%s'\n", data->port.c_str());
             }                
         }else{
             LogInfo(VB_PLUGIN, "No plugin.serial-event.json config file found\n");
@@ -133,221 +155,68 @@ public:
     }
 
     void CloseSerial() {
-        if (m_fd >= 0) {
+         if(th) {
+            exitSignal.set_value();
+            //Wait for thread to join
+            th->join();
+            th.reset(nullptr);            
+        }
+        if (m_fd != 0) {
             SerialClose(m_fd);
-            m_fd = -1;
         }
     }
 
-    int SerialDataAvailable(int fd) {
-        int bytes {0};
-        ioctl(fd, FIONREAD, &bytes);
-        return bytes;
+	void threadFunction(std::future<void> futureObj) {
+        //LogInfo(VB_PLUGIN, "Serial Thread Start\n");
+        //std::cout << "Thread Start" << std::endl;
+        while (futureObj.wait_for(std::chrono::milliseconds(100)) == std::future_status::timeout)
+        {
+            if (m_fd <= 0) {
+                LogInfo(VB_PLUGIN, "Serial Is Zero\n");
+            }
+			if(!data) {
+				return;
+			}
+            //LogInfo(VB_PLUGIN, "Serial Doing Some Work\n");
+            //std::cout << "Doing Some Work" << std::endl;
+            if(data->dataWaiting)
+            {
+                ProcessInputBuffer(data.get());
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+        }
+        LogInfo(VB_PLUGIN, "Serial Thread End\n");
+        std::cout << "Thread End" << std::endl;
     }
 
-    int SerialDataRead(int fd, char* buf, size_t len) {
-        // Read() (using read() ) will return an 'error' EAGAIN as it is
-        // set to non-blocking. This is not a true error within the
-        // functionality of Read, and thus should be handled by the caller.
-        int n = read(fd, buf, len);
-        if((n < 0) && (errno == EAGAIN)) return 0;
-        return n;
+	virtual void modifySequenceData(int ms, uint8_t *seqData) override {
+        try
+        {
+			if(!data) {
+				return;
+			}
+            TriksC_SendData(seqData);
+        }
+        catch(std::exception const& ex)
+        {
+            std::cout << ex.what();
+        }
     }
 
-    void remove_control_characters(std::string& s) {
-        s.erase(std::remove_if(s.begin(), s.end(), [](char c) { return std::iscntrl(c); }), s.end());
-    }
-
-    void TriksC_Dump(TriksCPrivData *privData) {
+    void TriksC_Dump(triksCPrivData *privData) {
         LogDebug(VB_PLUGIN, "  privData: %p\n", privData);
 
         if (!privData)
             return;
 
-        LogDebug(VB_PLUGIN, "    filename       : %s\n", privData->filename);
-        LogDebug(VB_PLUGIN, "    fd             : %d\n", privData->fd);
-        LogDebug(VB_PLUGIN, "    threadIsRunning: %d\n", privData->threadIsRunning);
-        LogDebug(VB_PLUGIN, "    runThread      : %d\n", privData->runThread);
+        LogDebug(VB_PLUGIN, "    port           : %s\n", privData->port);
         LogDebug(VB_PLUGIN, "    width          : %d\n", privData->width);
         LogDebug(VB_PLUGIN, "    height         : %d\n", privData->height);
         LogDebug(VB_PLUGIN, "    panels         : %d\n", privData->panels);
     }
 
-    void RunTriksCOutputThread(triksCPrivData *privData)
-    {
-        LogDebug(VB_PLUGIN, "RunTriksCOutputThread()\n");
-
-        long long wakeTime = GetTime();
-       long long lastProcTime = 0;
-       long long frameTime = 0;
-        //struct timeval  tv;
-       // struct timespec ts;
-
-        privData->threadIsRunning = true;
-        LogDebug(VB_PLUGIN, "Triks-C output thread started\n");
-
-        int panels = privData->panels;
-
-        while (privData->runThread)
-        {
-           LogExcess(VB_PLUGIN, "Triks-C output thread: woke\n");
-
-
-            // See if there is any data waiting to process or if we timed out
-
-            if (privData->dataWaiting)
-            {
-                ProcessInputBuffer(privData);
-                std::this_thread::sleep_for(96000us);
-            }
-            else
-            {
-               std::this_thread::sleep_for(10000us);//10ms
-            }
-        }
-
-        LogDebug(VB_PLUGIN, "Triks-C output thread complete\n");
-        privData->threadIsRunning = false;
-        return nullptr;
-    }
-
-    int TriksC_Open(const char *configStr) {
-        LogDebug(VB_PLUGIN, "TriksC_Open('%s')\n", configStr);
-
-        //TriksCPrivData *privData =
-        //    (TriksCPrivData *)malloc(sizeof(TriksCPrivData));
-       // if (privData == NULL)
-       // {
-       //     LogErr(VB_PLUGIN, "Error %d allocating private memory: %s\n",
-      //          errno, strerror(errno));
-       //     
-       //     return 0;
-       // }
-       // bzero(privData, sizeof(TriksCPrivData));
-        data = std::make_unique<triksCPrivData>();
-        privData->fd = -1;
-
-        char deviceName[32];
-        char cfg[1025];
-
-        strncpy(cfg, configStr, 1024);
-        char *s = strtok(cfg, ",;");
-
-        strcpy(deviceName, "UNKNOWN");
-
-        while (s) {
-            char tmp[128];
-            char *div = NULL;
-
-            strcpy(tmp, s);
-            div = strchr(tmp, '=');
-
-            if (div) {
-                *div = '\0';
-                div++;
-
-                if (!strcmp(tmp, "device")) {
-                    LogDebug(VB_CHANNELOUT, "Using %s for Triks-C output\n", div);
-                    strcpy(deviceName, div);
-                } else if (!strcmp(tmp, "layout")) {
-                    switch (div[0])
-                    {
-                        case '1':   privData->width = 1;
-                                    break;
-                        case '2':   privData->width = 2;
-                                    break;
-                        case '3':   privData->width = 3;
-                                    break;
-                        case '4':   privData->width = 4;
-                                    break;
-                        default:	LogDebug(VB_CHANNELOUT, "Invalid width (%c) in Triks-C layout: %s\n", div[0], div);
-                                    return 0;
-                    }
-                    switch (div[2])
-                    {
-                        case '1':   privData->height = 1;
-                                    break;
-                        case '2':   privData->height = 2;
-                                    break;
-                        case '3':   privData->height = 3;
-                                    break;
-                        case '4':   privData->height = 4;
-                                    break;
-                        default:	LogDebug(VB_CHANNELOUT, "Invalid height (%c) in Triks-C layout: %s\n", div[2], div);
-                                    return 0;
-                    }
-                    privData->panels = privData->width * privData->height;
-                }
-            }
-            s = strtok(NULL, ",;");
-        }
-
-        if (!strcmp(deviceName, "UNKNOWN"))
-        {
-            LogErr(VB_PLUGIN, "Invalid Config Str: %s\n", configStr);
-            free(privData);
-            return 0;
-        }
-
-        strcpy(privData->filename, "/dev/");
-        strcat(privData->filename, deviceName);
-
-        LogInfo(VB_PLUGIN, "Opening %s for Triks-C output\n",
-            privData->filename);
-
-        privData->fd = SerialOpen(privData->filename, 57600, "8N1");
-        if (privData->fd < 0)
-        {
-            LogErr(VB_PLUGIN, "Error %d opening %s: %s\n",
-                errno, privData->filename, strerror(errno));
-
-            free(privData);
-            return 0;
-        }
-
-        //pthread_mutex_init(&privData->bufLock, NULL);
-        //pthread_mutex_init(&privData->sendLock, NULL);
-        //pthread_cond_init(&privData->sendCond, NULL);
-        privData->runThread = 1;
-
-        privData->processThread = std::thread(RunTriksCOutputThread, privData);
-        privData->processThread.join();
-        //int result = pthread_create(&privData->processThreadID, NULL, &RunTriksCOutputThread, privData);
-
-        return 1;
-    }
-
-
-    int TriksC_Close(void *data) {
-        LogDebug(VB_PLUGIN, "TriksC_Close(%p)\n", data);
-
-        privData->runThread = 0;
-        SerialClose(privData->fd);
-        privData->fd = -1;
-        return 0;
-    }
-
-    int TriksC_IsConfigured(void) {
-        return 0;
-    }
-
-
-    int TriksC_IsActive(void *data) {
-        LogDebug(VB_PLUGIN, "TriksC_IsActive(%p)\n", data);
-        TriksCPrivData *privData = (TriksCPrivData*)data;
-
-        if (!privData)
-            return 0;
-
-        TriksC_Dump(privData);
-
-        if (privData->fd > 0)
-            return 1;
-
-        return 0;
-    }
-
-    void EncodeAndStore(TriksCPrivData *privData, int panel, unsigned char *ptr)
+    void EncodeAndStore(triksCPrivData *privData, int panel, unsigned char *ptr)
     {
         unsigned char uc = EncodeBytes(ptr);
 
@@ -373,7 +242,7 @@ public:
         }
     }
 
-    void EncodeWorkBuffer(TriksCPrivData *privData)
+    void EncodeWorkBuffer(triksCPrivData *privData)
     {
         int p = 0;
         int y = 0;
@@ -451,11 +320,11 @@ public:
     }
 
 
-    void ProcessInputBuffer(TriksCPrivData *privData)
+    void ProcessInputBuffer(triksCPrivData *privData)
     {
         privData->bufLock.lock();
         memcpy(privData->workBuf, privData->inBuf, TRIKSC_MAX_CHANNELS);
-        privData->dataWaiting = 0;
+        privData->dataWaiting = false;
         privData->bufLock.unlock();
 
         EncodeWorkBuffer(privData);
@@ -465,46 +334,44 @@ public:
 
         for (int p = 0; p < privData->panels; p++)
         {
-            write(privData->fd, privData->outBuf[p], privData->outputBytes[p]);
+            write(m_fd, privData->outBuf[p], privData->outputBytes[p]);
         }
     }
 
-    int TriksC_SendData(void *data, const char *channelData, int channelCount)
+    int TriksC_SendData(uint8_t *channelData)
     {
-        LogDebug(VB_PLUGIN, "TriksC_SendData(%p, %p, %d)\n",
-            data, channelData, channelCount);
+        //LogDebug(VB_PLUGIN, "TriksC_SendData(%p, %p, %d)\n",
+         //   data, channelData, channelCount);
 
-        TriksCPrivData *privData = (TriksCPrivData*)data;
+        //triksCPrivData *privData = (triksCPrivData*)data;
 
-        if (channelCount <= TRIKSC_MAX_CHANNELS) {
-            bzero(privData->inBuf, TRIKSC_MAX_CHANNELS);
+        if (data->channelCount <= TRIKSC_MAX_CHANNELS) {
+			data->bufLock.lock();
+            bzero(data->inBuf, TRIKSC_MAX_CHANNELS);
+			data->bufLock.unlock();
         } else {
             LogErr(VB_PLUGIN,
                 "TriksC_SendData() tried to send %d bytes when max is %d\n",
-                channelCount, TRIKSC_MAX_CHANNELS);
+                data->channelCount, TRIKSC_MAX_CHANNELS);
             return 0;
         }
 
         // Copy latest data to our input buffer for processing
-        privData->bufLock.lock();
-        memcpy(privData->inBuf, channelData, channelCount);
-        privData->dataWaiting = true;
-        privData->bufLock.unlock();
+        data->bufLock.lock();
+        memcpy(data->inBuf, &channelData[data->sc - 1], data->channelCount);
+        data->dataWaiting = true;
+        data->bufLock.unlock();
 
         //if (privData->threadIsRunning)
         //    pthread_cond_signal(&privData->sendCond);
         //else
         //    ProcessInputBuffer(privData);
-        return channelCount;
+        return data->channelCount;
     }
 
     /*
     *
     */
-    int TriksC_MaxChannels(void *data)
-    {
-        return TRIKSC_MAX_CHANNELS;
-    }
     
 unsigned char EncodeBytes(unsigned char *ptr)
 {
